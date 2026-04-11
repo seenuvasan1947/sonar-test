@@ -73,7 +73,7 @@ jobs:
         run: |
           echo "⏳ Polling SonarQube health endpoint..."
           MAX_RETRIES=60
-          RETRY_INTERVAL=2
+          RETRY_INTERVAL=5
           RETRY_COUNT=0
 
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
@@ -287,6 +287,133 @@ jobs:
 
           echo "❌ Quality Gate check timed out"
           exit 1
+
+      # ========================================================================
+      # STEP 8: Fetch Security Hotspots & Security Bugs
+      # ========================================================================
+      - name: Fetch Security Hotspots
+        id: security_hotspots
+        run: |
+          echo "🛡️ Fetching security hotspots..."
+
+          HOTSPOTS_RESPONSE=$(curl -s \
+            -u admin:${{ steps.set_password.outputs.password }} \
+            "${{ env.SONARQUBE_URL }}/api/hotspots/search?projectKey=${{ env.SONAR_PROJECT_KEY }}&ps=100" 2>/dev/null)
+
+          TOTAL_HOTSPOTS=$(echo "$HOTSPOTS_RESPONSE" | jq -r '.paging.total // 0')
+          echo "total=$TOTAL_HOTSPOTS" >> "$GITHUB_OUTPUT"
+
+          echo "  Total security hotspots: $TOTAL_HOTSPOTS"
+
+          if [ "$TOTAL_HOTSPOTS" -gt 0 ]; then
+            echo ""
+            echo "📊 Security Hotspot Details:"
+            echo "$HOTSPOTS_RESPONSE" | jq -r '.hotspots[] | "  - [\(.component)] \(.rule.key): \(.message)"' 2>/dev/null || echo "  (details unavailable)"
+          fi
+
+      - name: Fetch Security Bugs
+        id: security_bugs
+        run: |
+          echo "🐛 Fetching security bugs (vulnerabilities)..."
+
+          BUGS_RESPONSE=$(curl -s \
+            -u admin:${{ steps.set_password.outputs.password }} \
+            "${{ env.SONARQUBE_URL }}/api/issues/search?componentKeys=${{ env.SONAR_PROJECT_KEY }}&types=VULNERABILITY&ps=100" 2>/dev/null)
+
+          TOTAL_BUGS=$(echo "$BUGS_RESPONSE" | jq -r '.paging.total // 0')
+          echo "total=$TOTAL_BUGS" >> "$GITHUB_OUTPUT"
+
+          echo "  Total security bugs (vulnerabilities): $TOTAL_BUGS"
+
+          if [ "$TOTAL_BUGS" -gt 0 ]; then
+            echo ""
+            echo "📊 Security Bug Details:"
+            echo "$BUGS_RESPONSE" | jq -r '.issues[] | "  - [\(.component)] \(.rule): \(.message)"' 2>/dev/null || echo "  (details unavailable)"
+          fi
+
+      - name: Fetch Code Smells
+        id: code_smells
+        run: |
+          echo "🧹 Fetching code smells..."
+
+          SMELLS_RESPONSE=$(curl -s \
+            -u admin:${{ steps.set_password.outputs.password }} \
+            "${{ env.SONARQUBE_URL }}/api/issues/search?componentKeys=${{ env.SONAR_PROJECT_KEY }}&types=CODE_SMELL&ps=100" 2>/dev/null)
+
+          TOTAL_SMELLS=$(echo "$SMELLS_RESPONSE" | jq -r '.paging.total // 0')
+          echo "total=$TOTAL_SMELLS" >> "$GITHUB_OUTPUT"
+
+          echo "  Total code smells: $TOTAL_SMELLS"
+
+          if [ "$TOTAL_SMELLS" -gt 0 ]; then
+            echo ""
+            echo "📊 Top Code Smells:"
+            echo "$SMELLS_RESPONSE" | jq -r '.issues[:10] | .[] | "  - [\(.severity)] \(.component): \(.message)"' 2>/dev/null || echo "  (details unavailable)"
+          fi
+
+      - name: Fetch Bugs
+        id: bugs
+        run: |
+          echo "🐛 Fetching bugs..."
+
+          BUGS_RESPONSE=$(curl -s \
+            -u admin:${{ steps.set_password.outputs.password }} \
+            "${{ env.SONARQUBE_URL }}/api/issues/search?componentKeys=${{ env.SONAR_PROJECT_KEY }}&types=BUG&ps=100" 2>/dev/null)
+
+          TOTAL_BUGS=$(echo "$BUGS_RESPONSE" | jq -r '.paging.total // 0')
+          echo "total=$TOTAL_BUGS" >> "$GITHUB_OUTPUT"
+
+          echo "  Total bugs: $TOTAL_BUGS"
+
+          if [ "$TOTAL_BUGS" -gt 0 ]; then
+            echo ""
+            echo "📊 Bug Details:"
+            echo "$BUGS_RESPONSE" | jq -r '.issues[] | "  - [\(.severity)] \(.component): \(.message)"' 2>/dev/null || echo "  (details unavailable)"
+          fi
+
+      - name: Fail if Security Issues Found
+        run: |
+          echo "🚨 Evaluating security findings..."
+
+          HOTSPOTS=${{ steps.security_hotspots.outputs.total }}
+          VULNS=${{ steps.security_bugs.outputs.total }}
+          CODE_SMELLS=${{ steps.code_smells.outputs.total }}
+          BUGS=${{ steps.bugs.outputs.total }}
+
+          echo ""
+          echo "📊 Summary:"
+          echo "  🔴 Security vulnerabilities: $VULNS"
+          echo "  🟡 Security hotspots: $HOTSPOTS"
+          echo "  🐛 Bugs: $BUGS"
+          echo "  🧹 Code smells: $CODE_SMELLS"
+          echo ""
+
+          FAILED=false
+
+          if [ "$VULNS" -gt 0 ]; then
+            echo "❌ FAIL: $VULNS security vulnerability(ies) found!"
+            FAILED=true
+          fi
+
+          if [ "$HOTSPOTS" -gt 0 ]; then
+            echo "❌ FAIL: $HOTSPOTS security hotspot(s) found!"
+            FAILED=true
+          fi
+
+          if [ "$FAILED" = true ]; then
+            echo ""
+            echo "💡 Pipeline failed due to security issues."
+            echo "    Review the details above and fix the reported issues."
+            exit 1
+          else
+            echo "✅ No critical security issues found."
+            if [ "$CODE_SMELLS" -gt 0 ]; then
+              echo "  ⚠️ $CODE_SMELLS code smell(s) detected (warning only, not failing)."
+            fi
+            if [ "$BUGS" -gt 0 ]; then
+              echo "  ⚠️ $BUGS bug(s) detected (warning only, not failing)."
+            fi
+          fi
 
       # ========================================================================
       # STEP 8: Cleanup (Always runs, even on failure)
