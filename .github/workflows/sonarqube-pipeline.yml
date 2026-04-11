@@ -1,0 +1,296 @@
+# ============================================================================
+# SonarQube Ephemeral CI/CD Pipeline
+# ============================================================================
+# This workflow:
+#   1. Starts a fresh SonarQube server from Docker
+#   2. Changes admin password (via secret)
+#   3. Generates a scanner token programmatically
+#   4. Runs multi-language code analysis
+#   5. Checks Quality Gate status (fails pipeline if failed)
+#   6. Cleans up the container
+# ============================================================================
+
+name: SonarQube Analysis
+
+on:
+  push:
+    branches: [main, develop, master]
+  pull_request:
+    branches: [main, develop, master]
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  SONARQUBE_IMAGE: "sonarqube:10.4-community"
+  SONARQUBE_CONTAINER: "sonarqube-ephemeral-${{ github.run_id }}"
+  SONARQUBE_URL: "http://localhost:9000"
+  SONAR_ADMIN_USER: "admin"
+  SONAR_ADMIN_PASSWORD_DEFAULT: "admin"
+  SONAR_PROJECT_KEY: "multi-lang-project-${{ github.run_id }}"
+
+# Limit to one concurrent run to avoid port/resource conflicts
+concurrency:
+  group: sonarqube-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sonarqube-analysis:
+    name: SonarQube Multi-Language Analysis
+    runs-on: ubuntu-latest
+
+    # Resource constraints (GitHub Actions runners have ~7GB, we limit to ~4GB)
+    env:
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"  # Critical for Docker-in-Docker
+
+    steps:
+      # ========================================================================
+      # STEP 1: Checkout Repository
+      # ========================================================================
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for accurate Sonar analysis
+
+      # ========================================================================
+      # STEP 2: Start SonarQube Container
+      # ========================================================================
+      - name: Start SonarQube Server
+        run: |
+          echo "🚀 Starting SonarQube container: ${{ env.SONARQUBE_CONTAINER }}"
+          docker run -d \
+            --name ${{ env.SONARQUBE_CONTAINER }} \
+            --memory=4g \
+            --cpus=2.0 \
+            -p 9000:9000 \
+            -e SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true \
+            -e SONAR_SECURITY_REALM=internal \
+            ${{ env.SONARQUBE_IMAGE }}
+
+          echo "✅ Container started. Waiting for health check..."
+
+      # ========================================================================
+      # STEP 3: Health Check with Retry Logic (60-second timeout)
+      # ========================================================================
+      - name: Wait for SonarQube to be Ready
+        run: |
+          echo "⏳ Polling SonarQube health endpoint..."
+          MAX_RETRIES=30
+          RETRY_INTERVAL=2
+          RETRY_COUNT=0
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "  Attempt $RETRY_COUNT/$MAX_RETRIES..."
+
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${{ env.SONARQUBE_URL }}/api/system/status 2>/dev/null || echo "000")
+
+            if [ "$HTTP_STATUS" = "200" ]; then
+              STATUS=$(curl -s ${{ env.SONARQUBE_URL }}/api/system/status | jq -r '.status' 2>/dev/null)
+              echo "  SonarQube status: $STATUS"
+
+              if [ "$STATUS" = "UP" ]; then
+                echo "✅ SonarQube is UP and ready after $((RETRY_COUNT * RETRY_INTERVAL)) seconds!"
+                exit 0
+              fi
+            fi
+
+            echo "  Not ready yet (HTTP $HTTP_STATUS). Retrying in ${RETRY_INTERVAL}s..."
+            sleep $RETRY_INTERVAL
+          done
+
+          echo "❌ SonarQube failed to start within $((MAX_RETRIES * RETRY_INTERVAL)) seconds"
+          docker logs ${{ env.SONARQUBE_CONTAINER }} | tail -50
+          exit 1
+
+      # ========================================================================
+      # STEP 4: Change Admin Password
+      # ========================================================================
+      - name: Change Admin Password
+        run: |
+          echo "🔐 Changing admin password..."
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -u ${{ env.SONAR_ADMIN_USER }}:${{ env.SONAR_ADMIN_PASSWORD_DEFAULT }} \
+            -X POST "${{ env.SONARQUBE_URL }}/api/users/change_password?login=admin&previousPassword=${{ env.SONAR_ADMIN_PASSWORD_DEFAULT }}&password=${{ secrets.SONAR_ADMIN_PASSWORD }}" \
+            2>/dev/null)
+
+          if [ "$HTTP_STATUS" = "204" ]; then
+            echo "✅ Admin password changed successfully"
+          else
+            echo "❌ Failed to change admin password (HTTP $HTTP_STATUS)"
+            echo "Possible causes:"
+            echo "  - Secret SONAR_ADMIN_PASSWORD not set in GitHub Settings"
+            echo "  - Default credentials already changed"
+            exit 1
+          fi
+
+      # ========================================================================
+      # STEP 5: Generate Scanner Token (stored in memory only)
+      # ========================================================================
+      - name: Generate Scanner Token
+        id: generate_token
+        run: |
+          echo "🔑 Generating scanner token..."
+
+          TOKEN_RESPONSE=$(curl -s -X POST \
+            -u ${{ env.SONAR_ADMIN_USER }}:${{ secrets.SONAR_ADMIN_PASSWORD }} \
+            "${{ env.SONARQUBE_URL }}/api/user_tokens/generate" \
+            --data-urlencode "name=scanner-token-${{ github.run_id }}" \
+            --data-urlencode "type=PROJECT_ANALYSIS")
+
+          # Extract token from response (stored in memory via GITHUB_OUTPUT)
+          SCANNER_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.token // empty')
+
+          if [ -z "$SCANNER_TOKEN" ]; then
+            echo "❌ Failed to generate scanner token"
+            echo "Response: $TOKEN_RESPONSE"
+            exit 1
+          fi
+
+          # Store in GITHUB_OUTPUT (memory-only, never persisted to disk)
+          echo "token=$SCANNER_TOKEN" >> "$GITHUB_OUTPUT"
+          echo "✅ Scanner token generated successfully"
+
+      # ========================================================================
+      # STEP 6: Run SonarQube Scanner Analysis
+      # ========================================================================
+      - name: SonarQube Scanner
+        run: |
+          echo "🔍 Starting SonarQube analysis..."
+
+          # Create sonar-project.properties dynamically for multi-language support
+          cat > sonar-project.properties << EOF
+          sonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+          sonar.projectName=Multi-Language Project
+          sonar.sources=.
+          sonar.host.url=${{ env.SONARQUBE_URL }}
+          sonar.token=${{ steps.generate_token.outputs.token }}
+          sonar.qualitygate.wait=true
+          sonar.verbose=true
+
+          # Multi-language inclusions
+          sonar.inclusions=**/*.java,**/*.js,**/*.ts,**/*.jsx,**/*.tsx,**/*.py,**/*.cs,**/*.html,**/*.css,**/*.json,**/*.xml,**/*.sql,**/*.sh,**/*.yml,**/*.yaml,**/*.md
+
+          # Language-specific settings
+          sonar.java.source=17
+          sonar.javascript.lcov.reportPaths=coverage/lcov.info
+          sonar.python.coverage.reportPaths=coverage/coverage.xml
+          sonar.cs.opencover.reportsPaths=**/coverage.opencover.xml
+
+          # Exclusions
+          sonar.exclusions=**/node_modules/**,**/vendor/**,**/.git/**,**/target/**,**/bin/**,**/obj/**,**/dist/**,**/build/**,**/*.min.js,**/*.min.css,**/__pycache__/**,**/*.pyc
+          EOF
+
+          echo "📋 SonarQube configuration:"
+          cat sonar-project.properties
+
+          # Run SonarScanner via Docker
+          docker run --rm \
+            --network host \
+            -v "${{ github.workspace }}:/usr/src" \
+            -e SONAR_HOST_URL="${{ env.SONARQUBE_URL }}" \
+            sonarsource/sonar-scanner-cli \
+            -Dsonar.projectKey="${{ env.SONAR_PROJECT_KEY }}" \
+            -Dsonar.sources="." \
+            -Dsonar.host.url="${{ env.SONARQUBE_URL }}" \
+            -Dsonar.token="${{ steps.generate_token.outputs.token }}" \
+            -Dsonar.qualitygate.wait=true \
+            -Dsonar.verbose=true \
+            -Dsonar.inclusions="**/*.java,**/*.js,**/*.ts,**/*.jsx,**/*.tsx,**/*.py,**/*.cs,**/*.html,**/*.css,**/*.json,**/*.xml,**/*.sql,**/*.sh,**/*.yml,**/*.yaml,**/*.md" \
+            -Dsonar.java.source=17 \
+            -Dsonar.exclusions="**/node_modules/**,**/vendor/**,**/.git/**,**/target/**,**/bin/**,**/obj/**,**/dist/**,**/build/**,**/*.min.js,**/*.min.css,**/__pycache__/**,**/*.pyc"
+
+          echo "✅ SonarQube analysis completed"
+
+      # ========================================================================
+      # STEP 7: Wait for Background Analysis & Check Quality Gate
+      # ========================================================================
+      - name: Wait for Analysis Processing
+        run: |
+          echo "⏳ Waiting for SonarQube to finish background processing..."
+
+          MAX_RETRIES=60
+          RETRY_INTERVAL=5
+          RETRY_COUNT=0
+          TASK_ID=""
+
+          # Get the most recent task ID for this project
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+
+            TASK_RESPONSE=$(curl -s \
+              -u ${{ env.SONAR_ADMIN_USER }}:${{ secrets.SONAR_ADMIN_PASSWORD }} \
+              "${{ env.SONARQUBE_URL }}/api/ce/component?component=${{ env.SONAR_PROJECT_KEY }}" 2>/dev/null)
+
+            TASK_ID=$(echo "$TASK_RESPONSE" | jq -r '.current.id // empty')
+            TASK_STATUS=$(echo "$TASK_RESPONSE" | jq -r '.current.status // "PENDING"')
+
+            echo "  Task ID: $TASK_ID | Status: $TASK_STATUS"
+
+            if [ "$TASK_STATUS" = "SUCCESS" ] || [ "$TASK_STATUS" = "FAILED" ] || [ "$TASK_STATUS" = "CANCELED" ]; then
+              echo "✅ Task completed with status: $TASK_STATUS"
+              break
+            fi
+
+            if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+              echo "⚠️ Task still processing after $((RETRY_COUNT * RETRY_INTERVAL))s. Proceeding to Quality Gate check..."
+            else
+              echo "  Still processing... retrying in ${RETRY_INTERVAL}s"
+              sleep $RETRY_INTERVAL
+            fi
+          done
+
+      - name: Check Quality Gate Status
+        run: |
+          echo "🚦 Checking Quality Gate status..."
+
+          MAX_RETRIES=30
+          RETRY_INTERVAL=5
+          RETRY_COUNT=0
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+
+            QG_RESPONSE=$(curl -s \
+              -u ${{ env.SONAR_ADMIN_USER }}:${{ secrets.SONAR_ADMIN_PASSWORD }} \
+              "${{ env.SONARQUBE_URL }}/api/qualitygates/project_status?projectKey=${{ env.SONAR_PROJECT_KEY }}" 2>/dev/null)
+
+            QG_STATUS=$(echo "$QG_RESPONSE" | jq -r '.projectStatus.status // "UNKNOWN"')
+
+            echo "  Quality Gate status: $QG_STATUS (attempt $RETRY_COUNT/$MAX_RETRIES)"
+
+            if [ "$QG_STATUS" = "OK" ]; then
+              echo "✅ Quality Gate PASSED!"
+              exit 0
+            elif [ "$QG_STATUS" = "ERROR" ]; then
+              echo "❌ Quality Gate FAILED!"
+              echo ""
+              echo "📊 Failure details:"
+              echo "$QG_RESPONSE" | jq -r '.projectStatus.conditions[] | select(.status != "OK") | "  - \(.metricName): \(.actualValue) (threshold: \(.errorThreshold))"'
+              exit 1
+            fi
+
+            echo "  Still waiting... retrying in ${RETRY_INTERVAL}s"
+            sleep $RETRY_INTERVAL
+          done
+
+          echo "❌ Quality Gate check timed out"
+          exit 1
+
+      # ========================================================================
+      # STEP 8: Cleanup (Always runs, even on failure)
+      # ========================================================================
+      - name: Cleanup SonarQube Container
+        if: always()
+        run: |
+          echo "🧹 Cleaning up SonarQube container..."
+
+          # Stop and remove the container
+          docker stop ${{ env.SONARQUBE_CONTAINER }} 2>/dev/null || echo "Container already stopped"
+          docker rm ${{ env.SONARQUBE_CONTAINER }} 2>/dev/null || echo "Container already removed"
+
+          # Remove any dangling volumes
+          docker volume prune -f 2>/dev/null || true
+
+          echo "✅ Cleanup complete"
+          echo "📊 Container logs (last 100 lines):"
+          docker logs ${{ env.SONARQUBE_CONTAINER }} 2>&1 | tail -100 || echo "Logs unavailable"
