@@ -62,18 +62,17 @@ jobs:
             --cpus=2.0 \
             -p 9000:9000 \
             -e SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true \
-            -e SONAR_SECURITY_REALM=internal \
             ${{ env.SONARQUBE_IMAGE }}
 
           echo "✅ Container started. Waiting for health check..."
 
       # ========================================================================
-      # STEP 3: Health Check with Retry Logic (60-second timeout)
+      # STEP 3: Health Check with Retry Logic (120-second timeout)
       # ========================================================================
       - name: Wait for SonarQube to be Ready
         run: |
           echo "⏳ Polling SonarQube health endpoint..."
-          MAX_RETRIES=30
+          MAX_RETRIES=60
           RETRY_INTERVAL=2
           RETRY_COUNT=0
 
