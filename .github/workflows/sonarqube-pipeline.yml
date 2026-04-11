@@ -3,11 +3,13 @@
 # ============================================================================
 # This workflow:
 #   1. Starts a fresh SonarQube server from Docker
-#   2. Changes admin password (via secret)
+#   2. Generates a random password + changes admin credentials
 #   3. Generates a scanner token programmatically
 #   4. Runs multi-language code analysis
 #   5. Checks Quality Gate status (fails pipeline if failed)
 #   6. Cleans up the container
+#
+# NO secrets required! Everything is ephemeral and auto-generated.
 # ============================================================================
 
 name: SonarQube Analysis
@@ -23,8 +25,6 @@ env:
   SONARQUBE_IMAGE: "sonarqube:10.4-community"
   SONARQUBE_CONTAINER: "sonarqube-ephemeral-${{ github.run_id }}"
   SONARQUBE_URL: "http://localhost:9000"
-  SONAR_ADMIN_USER: "admin"
-  SONAR_ADMIN_PASSWORD_DEFAULT: "admin"
   SONAR_PROJECT_KEY: "multi-lang-project-${{ github.run_id }}"
 
 # Limit to one concurrent run to avoid port/resource conflicts
@@ -102,15 +102,23 @@ jobs:
           exit 1
 
       # ========================================================================
-      # STEP 4: Change Admin Password
+      # STEP 4: Generate Random Password + Change Admin Password
       # ========================================================================
+      - name: Generate Random Password
+        id: set_password
+        run: |
+          # Generate a cryptographically random 16-char password (memory only)
+          RANDOM_PASSWORD=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 16)
+          echo "password=$RANDOM_PASSWORD" >> "$GITHUB_OUTPUT"
+          echo "🔐 Random password generated (16 chars, alphanumeric)"
+
       - name: Change Admin Password
         run: |
-          echo "🔐 Changing admin password..."
+          echo "🔐 Changing admin password from default 'admin'..."
 
           HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -u ${{ env.SONAR_ADMIN_USER }}:${{ env.SONAR_ADMIN_PASSWORD_DEFAULT }} \
-            -X POST "${{ env.SONARQUBE_URL }}/api/users/change_password?login=admin&previousPassword=${{ env.SONAR_ADMIN_PASSWORD_DEFAULT }}&password=${{ secrets.SONAR_ADMIN_PASSWORD }}" \
+            -u admin:admin \
+            -X POST "${{ env.SONARQUBE_URL }}/api/users/change_password?login=admin&previousPassword=admin&password=${{ steps.set_password.outputs.password }}" \
             2>/dev/null)
 
           if [ "$HTTP_STATUS" = "204" ]; then
@@ -118,8 +126,8 @@ jobs:
           else
             echo "❌ Failed to change admin password (HTTP $HTTP_STATUS)"
             echo "Possible causes:"
-            echo "  - Secret SONAR_ADMIN_PASSWORD not set in GitHub Settings"
-            echo "  - Default credentials already changed"
+            echo "  - SonarQube not fully initialized"
+            echo "  - Default credentials already changed (should not happen on fresh container)"
             exit 1
           fi
 
@@ -132,7 +140,7 @@ jobs:
           echo "🔑 Generating scanner token..."
 
           TOKEN_RESPONSE=$(curl -s -X POST \
-            -u ${{ env.SONAR_ADMIN_USER }}:${{ secrets.SONAR_ADMIN_PASSWORD }} \
+            -u admin:${{ steps.set_password.outputs.password }} \
             "${{ env.SONARQUBE_URL }}/api/user_tokens/generate" \
             --data-urlencode "name=scanner-token-${{ github.run_id }}" \
             --data-urlencode "type=PROJECT_ANALYSIS")
@@ -218,7 +226,7 @@ jobs:
             RETRY_COUNT=$((RETRY_COUNT + 1))
 
             TASK_RESPONSE=$(curl -s \
-              -u ${{ env.SONAR_ADMIN_USER }}:${{ secrets.SONAR_ADMIN_PASSWORD }} \
+              -u admin:${{ steps.set_password.outputs.password }} \
               "${{ env.SONARQUBE_URL }}/api/ce/component?component=${{ env.SONAR_PROJECT_KEY }}" 2>/dev/null)
 
             TASK_ID=$(echo "$TASK_RESPONSE" | jq -r '.current.id // empty')
@@ -251,7 +259,7 @@ jobs:
             RETRY_COUNT=$((RETRY_COUNT + 1))
 
             QG_RESPONSE=$(curl -s \
-              -u ${{ env.SONAR_ADMIN_USER }}:${{ secrets.SONAR_ADMIN_PASSWORD }} \
+              -u admin:${{ steps.set_password.outputs.password }} \
               "${{ env.SONARQUBE_URL }}/api/qualitygates/project_status?projectKey=${{ env.SONAR_PROJECT_KEY }}" 2>/dev/null)
 
             QG_STATUS=$(echo "$QG_RESPONSE" | jq -r '.projectStatus.status // "UNKNOWN"')

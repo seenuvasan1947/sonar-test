@@ -1,19 +1,13 @@
 # 📋 Environment Variables & Setup Instructions
 
-## Required CI/CD Secrets
+## ✅ NO Secrets Required!
 
-You must configure the following **GitHub Secret** in your repository:
+This pipeline is **fully self-contained**. Since the SonarQube container is:
+- 🔄 Fresh every run (no persistence)
+- 🗑️ Destroyed after analysis
+- 🔐 Password auto-generated randomly each run
 
-| Secret Name | Description | Example | Required |
-|-------------|-------------|---------|----------|
-| `SONAR_ADMIN_PASSWORD` | Secure password to replace default `admin` | `MyS3cur3P@ss!` | ✅ Yes |
-
-### How to Set GitHub Secrets:
-
-1. Go to your GitHub repository
-2. Navigate to **Settings** → **Secrets and variables** → **Actions**
-3. Click **New repository secret**
-4. Add `SONAR_ADMIN_PASSWORD` with a strong password (min 8 chars, mixed case, numbers, symbols)
+**You don't need to configure anything!** Just push and the pipeline runs.
 
 ---
 
