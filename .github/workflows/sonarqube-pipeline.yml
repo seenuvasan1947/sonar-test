@@ -289,27 +289,108 @@ jobs:
           exit 1
 
       # ========================================================================
-      # STEP 8: Fetch Security Hotspots & Security Bugs
+      # STEP 8: Fetch All Findings & Generate Report Artifact
       # ========================================================================
-      - name: Fetch Security Hotspots
-        id: security_hotspots
+      - name: Fetch All Findings
+        id: fetch_all
         run: |
-          echo "🛡️ Fetching security hotspots..."
+          echo "📥 Fetching all findings from SonarQube..."
 
-          HOTSPOTS_RESPONSE=$(curl -s \
-            -u admin:${{ steps.set_password.outputs.password }} \
-            "${{ env.SONARQUBE_URL }}/api/hotspots/search?projectKey=${{ env.SONAR_PROJECT_KEY }}&ps=100" 2>/dev/null)
+          AUTH="admin:${{ steps.set_password.outputs.password }}"
+          BASE_URL="${{ env.SONARQUBE_URL }}"
+          PK="${{ env.SONAR_PROJECT_KEY }}"
 
-          TOTAL_HOTSPOTS=$(echo "$HOTSPOTS_RESPONSE" | jq -r '.paging.total // 0')
-          echo "total=$TOTAL_HOTSPOTS" >> "$GITHUB_OUTPUT"
+          # Fetch security hotspots
+          echo "  Fetching hotspots..."
+          HOTSPOTS=$(curl -s -u "$AUTH" "$BASE_URL/api/hotspots/search?projectKey=$PK&ps=500" 2>/dev/null)
 
-          echo "  Total security hotspots: $TOTAL_HOTSPOTS"
+          # Fetch vulnerabilities
+          echo "  Fetching vulnerabilities..."
+          VULNS=$(curl -s -u "$AUTH" "$BASE_URL/api/issues/search?componentKeys=$PK&types=VULNERABILITY&ps=500" 2>/dev/null)
 
-          if [ "$TOTAL_HOTSPOTS" -gt 0 ]; then
-            echo ""
-            echo "📊 Security Hotspot Details:"
-            echo "$HOTSPOTS_RESPONSE" | jq -r '.hotspots[] | "  - [\(.component)] \(.rule.key): \(.message)"' 2>/dev/null || echo "  (details unavailable)"
-          fi
+          # Fetch code smells
+          echo "  Fetching code smells..."
+          SMELLS=$(curl -s -u "$AUTH" "$BASE_URL/api/issues/search?componentKeys=$PK&types=CODE_SMELL&ps=500" 2>/dev/null)
+
+          # Fetch bugs
+          echo "  Fetching bugs..."
+          BUGS_JSON=$(curl -s -u "$AUTH" "$BASE_URL/api/issues/search?componentKeys=$PK&types=BUG&ps=500" 2>/dev/null)
+
+          # Fetch security bugs (same as vulnerabilities but via issues API)
+          echo "  Fetching security bugs..."
+          SEC_BUGS=$(curl -s -u "$AUTH" "$BASE_URL/api/issues/search?componentKeys=$PK&types=VULNERABILITY&ps=500" 2>/dev/null)
+
+          # Save full responses to temp files for artifact
+          mkdir -p /tmp/sonar-report
+          echo "$HOTSPOTS" > /tmp/sonar-report/hotspots.json
+          echo "$VULNS" > /tmp/sonar-report/vulnerabilities.json
+          echo "$SMELLS" > /tmp/sonar-report/code_smells.json
+          echo "$BUGS_JSON" > /tmp/sonar-report/bugs.json
+
+          # Extract counts
+          HOTSPOT_COUNT=$(echo "$HOTSPOTS" | jq -r '.paging.total // 0')
+          VULN_COUNT=$(echo "$VULNS" | jq -r '.paging.total // 0')
+          SMELL_COUNT=$(echo "$SMELLS" | jq -r '.paging.total // 0')
+          BUG_COUNT=$(echo "$BUGS_JSON" | jq -r '.paging.total // 0')
+
+          echo "hotspot_count=$HOTSPOT_COUNT" >> "$GITHUB_OUTPUT"
+          echo "vuln_count=$VULN_COUNT" >> "$GITHUB_OUTPUT"
+          echo "smell_count=$SMELL_COUNT" >> "$GITHUB_OUTPUT"
+          echo "bug_count=$BUG_COUNT" >> "$GITHUB_OUTPUT"
+
+          echo ""
+          echo "📊 Summary:"
+          echo "  🔴 Vulnerabilities: $VULN_COUNT"
+          echo "  🟡 Security hotspots: $HOTSPOT_COUNT"
+          echo "  🐛 Bugs: $BUG_COUNT"
+          echo "  🧹 Code smells: $SMELL_COUNT"
+
+      - name: Generate Security Report
+        run: |
+          echo "📝 Generating security report..."
+
+          jq -n \
+            --arg project "${{ env.SONAR_PROJECT_KEY }}" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg repo "${{ github.repository }}" \
+            --arg branch "${{ github.ref_name }}" \
+            --arg commit "${{ github.sha }}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg sonar_url "${{ env.SONARQUBE_URL }}" \
+            --slurpfile hotspots /tmp/sonar-report/hotspots.json \
+            --slurpfile vulns /tmp/sonar-report/vulnerabilities.json \
+            --slurpfile smells /tmp/sonar-report/code_smells.json \
+            --slurpfile bugs /tmp/sonar-report/bugs.json \
+            '{
+              report_metadata: {
+                project_key: $project,
+                github_run_id: $run_id,
+                repository: $repo,
+                branch: $branch,
+                commit_sha: $commit,
+                generated_at: $timestamp,
+                sonarqube_url: $sonar_url
+              },
+              summary: {
+                security_hotspots: ($hotspots[0].paging.total // 0),
+                vulnerabilities: ($vulns[0].paging.total // 0),
+                bugs: ($bugs[0].paging.total // 0),
+                code_smells: ($smells[0].paging.total // 0)
+              },
+              security_hotspots: $hotspots[0],
+              vulnerabilities: $vulns[0],
+              bugs: $bugs[0],
+              code_smells: $smells[0]
+            }' > /tmp/sonar-report/security-report.json
+
+          echo "✅ Report generated at /tmp/sonar-report/security-report.json"
+
+      - name: Upload Security Report as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-security-report-${{ github.run_id }}
+          path: /tmp/sonar-report/security-report.json
+          retention-days: 30
 
       - name: Fetch Security Bugs
         id: security_bugs
@@ -375,10 +456,10 @@ jobs:
         run: |
           echo "🚨 Evaluating security findings..."
 
-          HOTSPOTS=${{ steps.security_hotspots.outputs.total }}
-          VULNS=${{ steps.security_bugs.outputs.total }}
-          CODE_SMELLS=${{ steps.code_smells.outputs.total }}
-          BUGS=${{ steps.bugs.outputs.total }}
+          HOTSPOTS=${{ steps.fetch_all.outputs.hotspot_count }}
+          VULNS=${{ steps.fetch_all.outputs.vuln_count }}
+          CODE_SMELLS=${{ steps.fetch_all.outputs.smell_count }}
+          BUGS=${{ steps.fetch_all.outputs.bug_count }}
 
           echo ""
           echo "📊 Summary:"
@@ -403,7 +484,7 @@ jobs:
           if [ "$FAILED" = true ]; then
             echo ""
             echo "💡 Pipeline failed due to security issues."
-            echo "    Review the details above and fix the reported issues."
+            echo "    Review the details above or download the security report artifact."
             exit 1
           else
             echo "✅ No critical security issues found."
