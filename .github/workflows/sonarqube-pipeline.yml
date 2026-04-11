@@ -138,18 +138,23 @@ jobs:
         run: |
           echo "🔑 Generating scanner token..."
 
-          TOKEN_RESPONSE=$(curl -s -X POST \
+          TOKEN_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             -u admin:${{ steps.set_password.outputs.password }} \
             "${{ env.SONARQUBE_URL }}/api/user_tokens/generate" \
-            --data-urlencode "name=scanner-token-${{ github.run_id }}" \
-            --data-urlencode "type=PROJECT_ANALYSIS")
+            --data-urlencode "name=scanner-token-${{ github.run_id }}")
+
+          HTTP_CODE=$(echo "$TOKEN_RESPONSE" | tail -1)
+          BODY=$(echo "$TOKEN_RESPONSE" | sed '$d')
+
+          echo "  HTTP status: $HTTP_CODE"
+          echo "  Response: $BODY"
 
           # Extract token from response (stored in memory via GITHUB_OUTPUT)
-          SCANNER_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.token // empty')
+          SCANNER_TOKEN=$(echo "$BODY" | jq -r '.token // empty')
 
-          if [ -z "$SCANNER_TOKEN" ]; then
+          if [ -z "$SCANNER_TOKEN" ] || [ "$HTTP_CODE" != "200" ]; then
             echo "❌ Failed to generate scanner token"
-            echo "Response: $TOKEN_RESPONSE"
+            echo "Response: $BODY"
             exit 1
           fi
 
