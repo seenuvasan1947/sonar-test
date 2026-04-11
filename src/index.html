@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Test Page</title>
+    <!-- BUG: Inline styles, deprecated attributes -->
+</head>
+<body>
+    <!-- BUG: Inline event handlers -->
+    <button onclick="alert('clicked')">Click Me</button>
+    
+    <!-- BUG: Missing alt attribute -->
+    <img src="photo.jpg">
+    
+    <!-- BUG: Deprecated attribute -->
+    <table border="1" cellpadding="5" cellspacing="5">
+        <tr>
+            <td>
+                <!-- BUG: Nested tables -->
+                <table>
+                    <tr>
+                        <td>Nested content</td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+    
+    <!-- BUG: Inline script with document.write -->
+    <script>
+        document.write('<p>Deprecated method</p>');
+        
+        // BUG: Using var instead of let/const
+        var userName = "test";
+        
+        // BUG: eval usage
+        var data = eval('{"key": "value"}');
+        
+        // BUG: No error handling
+        fetch('/api/data')
+            .then(response => response.json())
+            .then(data => console.log(data));
+    </script>
+</body>
+</html>
