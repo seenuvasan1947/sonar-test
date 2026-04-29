@@ -1,0 +1,5 @@
+.git
+*.md
+analyze.bat
+sonar-output
+docker-sonar-analyzer
